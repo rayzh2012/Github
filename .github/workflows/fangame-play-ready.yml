@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   package:
@@ -79,8 +80,6 @@ jobs:
           } > "$ROOT/PLAY_READY_MANIFEST.txt"
           echo '--- manifest ---'
           cat "$ROOT/PLAY_READY_MANIFEST.txt"
-          echo '--- top-level ---'
-          find "$ROOT" -maxdepth 3 -type f | head -100
           EXE_COUNT=$(find "$ROOT" -type f -iname '*.exe' | wc -l)
           if [ "$EXE_COUNT" -lt 1 ]; then
             echo 'No executable found after extraction' >&2
@@ -95,3 +94,13 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
+
+      - name: Report run id
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "PLAY_READY_RESULT ${{ matrix.slug }} run ${GITHUB_RUN_ID}" \
+            --body "slug=${{ matrix.slug }}%0Atitle=${{ matrix.title }}%0Arun_id=${GITHUB_RUN_ID}%0Asha256=${{ matrix.sha256 }}"
