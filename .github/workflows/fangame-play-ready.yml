@@ -45,6 +45,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Temporary branch-only chaos test: prove xiaotanxuexiao can recover from a hard current-build failure.
+          if [ "$GITHUB_REF_NAME" = 'fix/fangame-play-ready-rollback' ] && [ '${{ matrix.slug }}' = 'xiaotanxuexiao' ]; then
+            echo 'Intentional rollback-path test for xiaotanxuexiao' >&2
+            exit 86
+          fi
+
           sudo apt-get update -qq
           sudo apt-get install -y -qq p7zip-full unrar || sudo apt-get install -y -qq p7zip-full
 
