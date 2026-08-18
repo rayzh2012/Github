@@ -5,9 +5,16 @@ on:
     paths:
       - '.github/workflows/fangame-play-ready.yml'
   workflow_dispatch:
+    inputs:
+      force_rollback:
+        description: 'Skip source rebuild and restore the newest last-known-good artifact from master'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
+  actions: read
   issues: write
 
 jobs:
@@ -30,29 +37,23 @@ jobs:
             url: https://99dj.197784.com/9dj2/f/lingerxuzhuan.rar
             sha256: a821c80d6eba4ae25f8740e84dd897a5cec65b3aee8dea87ce4d4a4b31b573f0
     steps:
-      - name: Install archive tools
+      - name: Try current source build
+        id: current
+        if: github.event_name != 'workflow_dispatch' || inputs.force_rollback != true
+        continue-on-error: true
+        shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update -qq
           sudo apt-get install -y -qq p7zip-full unrar || sudo apt-get install -y -qq p7zip-full
 
-      - name: Download source
-        shell: bash
-        run: |
-          set -euo pipefail
           curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 --max-time 1800 \
             '${{ matrix.url }}' -o source.rar
           ls -lh source.rar
-
-      - name: Verify original SHA256
-        shell: bash
-        run: |
-          set -euo pipefail
           echo '${{ matrix.sha256 }}  source.rar' | sha256sum -c -
 
-      - name: Extract to play-ready folder
-        shell: bash
-        run: |
-          set -euo pipefail
+          rm -rf PLAY_READY
           mkdir -p 'PLAY_READY/${{ matrix.slug }}'
           if command -v unrar >/dev/null 2>&1; then
             unrar x -o+ source.rar 'PLAY_READY/${{ matrix.slug }}/'
@@ -61,10 +62,6 @@ jobs:
           fi
           rm -f source.rar
 
-      - name: Build manifest and validate RPG Maker structure
-        shell: bash
-        run: |
-          set -euo pipefail
           ROOT='PLAY_READY/${{ matrix.slug }}'
           {
             echo 'Title: ${{ matrix.title }}'
@@ -80,11 +77,92 @@ jobs:
           } > "$ROOT/PLAY_READY_MANIFEST.txt"
           echo '--- manifest ---'
           cat "$ROOT/PLAY_READY_MANIFEST.txt"
+
           EXE_COUNT=$(find "$ROOT" -type f -iname '*.exe' | wc -l)
           if [ "$EXE_COUNT" -lt 1 ]; then
             echo 'No executable found after extraction' >&2
             exit 1
           fi
+
+      - name: Roll back to last known-good artifact
+        id: rollback
+        if: steps.current.outcome == 'failure' || (github.event_name == 'workflow_dispatch' && inputs.force_rollback == true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: ${{ matrix.slug }}_PLAY_READY
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Current package is unavailable; looking for last known-good ${ARTIFACT_NAME} on master."
+          rm -rf PLAY_READY
+          mkdir -p PLAY_READY
+
+          SOURCE_RUN=''
+          while read -r run_id; do
+            [ -n "$run_id" ] || continue
+            [ "$run_id" != "$GITHUB_RUN_ID" ] || continue
+
+            artifact_id=$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+              --jq ".artifacts[] | select(.expired == false and .name == \"${ARTIFACT_NAME}\") | .id" \
+              | head -n 1 || true)
+
+            if [ -n "$artifact_id" ]; then
+              echo "Found ${ARTIFACT_NAME} in run ${run_id}; restoring it."
+              if gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n "$ARTIFACT_NAME" -D PLAY_READY; then
+                EXE_COUNT=$(find PLAY_READY -type f -iname '*.exe' | wc -l)
+                if [ "$EXE_COUNT" -ge 1 ]; then
+                  SOURCE_RUN="$run_id"
+                  break
+                fi
+              fi
+              echo "Artifact from run ${run_id} did not validate; trying an older run."
+              rm -rf PLAY_READY
+              mkdir -p PLAY_READY
+            fi
+          done < <(
+            gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow 'Fangame Play Ready' \
+              --branch master \
+              --limit 50 \
+              --json databaseId \
+              --jq '.[].databaseId'
+          )
+
+          if [ -z "$SOURCE_RUN" ]; then
+            echo "No non-expired last-known-good artifact named ${ARTIFACT_NAME} was found on master." >&2
+            exit 1
+          fi
+
+          cat > PLAY_READY/ROLLBACK_PROVENANCE.txt <<EOF
+          artifact=${ARTIFACT_NAME}
+          source_run=${SOURCE_RUN}
+          restored_by_run=${GITHUB_RUN_ID}
+          restored_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          echo "source_run=${SOURCE_RUN}" >> "$GITHUB_OUTPUT"
+          {
+            echo '### PLAY_READY rollback used'
+            echo
+            echo "- Artifact: \`${ARTIFACT_NAME}\`"
+            echo "- Source run: \`${SOURCE_RUN}\`"
+            echo "- Restored by run: \`${GITHUB_RUN_ID}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record current build
+        if: steps.current.outcome == 'success'
+        shell: bash
+        run: |
+          {
+            echo '### PLAY_READY current source build succeeded'
+            echo
+            echo '- Artifact: `${{ matrix.slug }}_PLAY_READY`'
+            echo '- Rollback used: no'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload play-ready artifact
         uses: actions/upload-artifact@v4
@@ -93,14 +171,22 @@ jobs:
           path: PLAY_READY/
           compression-level: 0
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90
 
       - name: Report run id
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          ROLLBACK_SOURCE_RUN: ${{ steps.rollback.outputs.source_run }}
         shell: bash
         run: |
+          set -euo pipefail
+          if [ "$ROLLBACK_OUTCOME" = 'success' ]; then
+            rollback_used=true
+          else
+            rollback_used=false
+          fi
           gh issue create --repo "$GITHUB_REPOSITORY" \
             --title "PLAY_READY_RESULT ${{ matrix.slug }} run ${GITHUB_RUN_ID}" \
-            --body "slug=${{ matrix.slug }}%0Atitle=${{ matrix.title }}%0Arun_id=${GITHUB_RUN_ID}%0Asha256=${{ matrix.sha256 }}"
+            --body "slug=${{ matrix.slug }}%0Atitle=${{ matrix.title }}%0Arun_id=${GITHUB_RUN_ID}%0Asha256=${{ matrix.sha256 }}%0Arollback_used=${rollback_used}%0Arollback_source_run=${ROLLBACK_SOURCE_RUN}"
