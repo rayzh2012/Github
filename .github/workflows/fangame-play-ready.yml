@@ -1,0 +1,97 @@
+name: Fangame Play Ready
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fangame-play-ready.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: xiaotanxuexiao
+            title: 笑谈学校
+            url: https://99dj.197784.com/9dj2/f/xiaotanxuexiao.rar
+            sha256: b601f9f602dcfdd3cbd5fedd190fd10403a72f9cba4fc0223d7fe07f39da6b97
+          - slug: jionghun
+            title: 囧魂
+            url: https://99dj.197784.com/9dj1/JiongHun.rar
+            sha256: 08fe10490b9dac47a85e2a7f2bc5bdeb47714e6102aeb9698b29aa52b1811df9
+          - slug: lingerxuzhuan
+            title: 仙剑奇侠传：灵儿续传
+            url: https://99dj.197784.com/9dj2/f/lingerxuzhuan.rar
+            sha256: a821c80d6eba4ae25f8740e84dd897a5cec65b3aee8dea87ce4d4a4b31b573f0
+    steps:
+      - name: Install archive tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full unrar || sudo apt-get install -y -qq p7zip-full
+
+      - name: Download source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 --max-time 1800 \
+            '${{ matrix.url }}' -o source.rar
+          ls -lh source.rar
+
+      - name: Verify original SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '${{ matrix.sha256 }}  source.rar' | sha256sum -c -
+
+      - name: Extract to play-ready folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p 'PLAY_READY/${{ matrix.slug }}'
+          if command -v unrar >/dev/null 2>&1; then
+            unrar x -o+ source.rar 'PLAY_READY/${{ matrix.slug }}/'
+          else
+            7z x source.rar '-oPLAY_READY/${{ matrix.slug }}' -y
+          fi
+          rm -f source.rar
+
+      - name: Build manifest and validate RPG Maker structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT='PLAY_READY/${{ matrix.slug }}'
+          {
+            echo 'Title: ${{ matrix.title }}'
+            echo 'Engine: RPG Maker XP'
+            echo 'Source SHA256: ${{ matrix.sha256 }}'
+            echo 'Packaged by GitHub Actions for direct-play convenience.'
+            echo
+            echo 'Launch candidates:'
+            find "$ROOT" -type f \( -iname 'game.exe' -o -iname '*.exe' \) -print | head -30
+            echo
+            echo 'RPG Maker markers:'
+            find "$ROOT" -type f \( -iname 'game.ini' -o -iname 'game.rxproj' -o -iname '*.rgssad' \) -print | head -30
+          } > "$ROOT/PLAY_READY_MANIFEST.txt"
+          echo '--- manifest ---'
+          cat "$ROOT/PLAY_READY_MANIFEST.txt"
+          echo '--- top-level ---'
+          find "$ROOT" -maxdepth 3 -type f | head -100
+          EXE_COUNT=$(find "$ROOT" -type f -iname '*.exe' | wc -l)
+          if [ "$EXE_COUNT" -lt 1 ]; then
+            echo 'No executable found after extraction' >&2
+            exit 1
+          fi
+
+      - name: Upload play-ready artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.slug }}_PLAY_READY
+          path: PLAY_READY/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
